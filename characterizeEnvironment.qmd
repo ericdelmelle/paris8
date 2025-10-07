@@ -19,8 +19,6 @@ execute:
   message: false
 ---
 
-[Lien vers la repo](https://github.com/ericdelmelle/paris8)
-
 # Introduction
 
 Ce document présente une méthodologie d'analyse de l'environnement autour de sites d'intérêt (ici, des lieux de piqûres de tiques potentielles) en utilisant les données de couverture terrestre **CLC+ Backbone 2018** à résolution 10 m.
