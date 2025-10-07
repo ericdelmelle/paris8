@@ -19,7 +19,7 @@ execute:
   message: false
 ---
 
-[Link to qmd (quarto markdown)](https://github.com/BSTA-150/chapter5/blob/main/chapter5.qmd)
+[Lien vers la repo](https://github.com/ericdelmelle/paris8)
 
 # Introduction
 
