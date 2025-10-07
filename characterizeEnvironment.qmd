@@ -1,0 +1,677 @@
+---
+title: "Caractérisation de l'environnement autour des piqûres de tiques"
+subtitle: "Analyse spatiale par données de couverture terrestre CLC+"
+author: "Eric Delmelle (pour Paris8)"
+date: today
+format: 
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    number-sections: true
+    code-fold: show
+    code-tools: true
+    theme: cosmo
+    self-contained: true
+editor: visual
+execute:
+  warning: false
+  message: false
+---
+
+[Link to qmd (quarto markdown)](https://github.com/BSTA-150/chapter5/blob/main/chapter5.qmd)
+
+# Introduction
+
+Ce document présente une méthodologie d'analyse de l'environnement autour de sites d'intérêt (ici, des lieux de piqûres de tiques potentielles) en utilisant les données de couverture terrestre **CLC+ Backbone 2018** à résolution 10 m.
+
+L'objectif est de **quantifier la composition paysagère** (urbain, forêt, agricole, autres) dans des buffers circulaires et des anneaux de distance autour de chaque site, puis d'explorer la **sensibilité** des résultats aux choix méthodologiques :
+
+-   **Variables** : définition des catégories (ex: prairies incluses ou non dans "agricole")
+-   **Granularité** : effet du rayon du buffer
+-   **Composition** : traitement des proportions et transformations CLR
+
+------------------------------------------------------------------------
+
+# Configuration {#sec-setup}
+
+## Packages requis
+
+```{r setup}
+# auto-installation si besoin
+pkgs <- c("sf","terra","exactextractr","dplyr","tidyr","ggplot2","compositions","tmap")
+to_install <- setdiff(pkgs, rownames(installed.packages()))
+if (length(to_install)) install.packages(to_install, repos="https://cloud.r-project.org")
+
+# charge paquets
+lapply(c("sf","terra","dplyr","tidyr","ggplot2","compositions","tmap"), library, character.only = TRUE)
+
+# drapeau pour l’extraction exacte pondérée
+has_exact <- requireNamespace("exactextractr", quietly = TRUE)
+if (has_exact) library(exactextractr)
+```
+
+## Chargement du raster CLC+
+
+Le raster est en **EPSG:3035** (LAEA Europe). Si la projection n'est pas lue correctement, on l'assigne explicitement.
+
+```{r load-raster}
+# Chemin vers le raster
+raster_path <- "CLCplus_2018_010m.tif"
+raster_clc <- rast(raster_path)
+
+# Définition WKT pour EPSG:3035 si nécessaire
+wkt3035 <- 'PROJCRS["ETRS89-extended / LAEA Europe",
+ BASEGEOGCRS["ETRS89",
+   DATUM["European Terrestrial Reference System 1989",
+     ELLIPSOID["GRS 1980",6378137,298.257222101]],
+   PRIMEM["Greenwich",0]],
+ CONVERSION["Lambert Azimuthal Equal Area",
+   METHOD["Lambert Azimuthal Equal Area"],
+   PARAMETER["Latitude of natural origin",52],
+   PARAMETER["Longitude of natural origin",10],
+   PARAMETER["False easting",4321000],
+   PARAMETER["False northing",3210000]],
+ CS[Cartesian,2],
+   AXIS["easting (X)",east],
+   AXIS["northing (Y)",north],
+   LENGTHUNIT["metre",1],
+ ID["EPSG",3035]]'
+
+if (is.na(crs(raster_clc)) || crs(raster_clc) == "") {
+  crs(raster_clc) <- wkt3035
+}
+
+# Vérifications
+cat("Résolution:", res(raster_clc), "m\n")
+cat("Projection:", as.character(crs(raster_clc, proj = TRUE)), "\n")
+```
+
+------------------------------------------------------------------------
+
+# Sites d'intérêt {#sec-sites}
+
+Trois sites en région parisienne, avec coordonnées géographiques (WGS84) :
+
+```{r define-sites}
+sites <- tibble::tribble(
+  ~site,                      ~lon,       ~lat,
+  "Orly – pistes",            2.3658,     48.7283,
+  "Forêt de Fontainebleau",   2.6667,     48.4167,
+  "Étampes – plaine agricole",2.1615,     48.4343
+)
+
+knitr::kable(sites, caption = "Coordonnées des sites d'étude")
+```
+
+------------------------------------------------------------------------
+
+# Fonctions utilitaires {#sec-functions}
+
+## Mapping des classes CLC+ vers familles
+
+Le **CLC+ Backbone** contient 11 classes principales (1--11). On les regroupe en 4 familles :
+
+-   **Urbain** : classe 1 (surfaces scellées)
+-   **Forêt** : classes 2--4 (arbres)
+-   **Agricole** :
+    -   Mode `"strict"` : classe 7 uniquement (cultures périodiques)
+    -   Mode `"large"` : classes 6--7 (herbacées permanentes + cultures)
+-   **Autres** : tout le reste (5, 8--11)
+
+```{r map-famille}
+map_famille <- function(valeur_pixel, mode_agricole = c("strict", "large")) {
+  mode_agricole <- match.arg(mode_agricole)
+  if (valeur_pixel == 1) return("urbain")
+  if (valeur_pixel %in% c(2,3,4)) return("foret")
+  if (mode_agricole == "strict" && valeur_pixel %in% 7) return("agricole")
+  if (mode_agricole == "large"  && valeur_pixel %in% c(6,7)) return("agricole")
+  return("autres")
+}
+
+.extract_weighted_table <- function(geom_input, raster_input, mode_agricole = "strict", mapping_list = NULL){
+  # sortie: data.frame(famille, weight)
+  if (exists("has_exact") && isTRUE(has_exact)) {
+    # exact (pondéré par fraction de couverture)
+    out <- exactextractr::exact_extract(
+      raster_input, geom_input,
+      fun = function(values, coverage_fractions){
+        df <- data.frame(val = values, w = coverage_fractions)
+        df <- df[!is.na(df$val) & df$val %in% 1:11, ]
+        if (is.null(mapping_list)) {
+          df$famille <- vapply(df$val, function(x) map_famille(x, mode_agricole), character(1))
+        } else {
+          df$famille <- "autres"
+          for (nm in names(mapping_list)) df$famille[df$val %in% mapping_list[[nm]]] <- nm
+        }
+        aggregate(w ~ famille, df, sum)
+      }
+    )[[1]]
+    names(out) <- c("famille","weight")
+    return(out)
+  } else {
+    # fallback approx: cellules entièrement dans le polygone (pas de pondération de bord)
+    g <- terra::vect(sf::st_as_sf(geom_input))
+    r_crop <- terra::crop(raster_input, g)
+    r_mask <- terra::mask(r_crop, g)
+    tab <- as.data.frame(terra::freq(r_mask, useNA="no"))
+    if (is.null(tab) || !nrow(tab)) return(data.frame(famille=character(0), weight=numeric(0)))
+    tab <- tab[tab$value %in% 1:11, c("value","count")]
+    if (is.null(mapping_list)) {
+      tab$famille <- vapply(tab$value, function(x) map_famille(x, mode_agricole), character(1))
+    } else {
+      tab$famille <- "autres"
+      for (nm in names(mapping_list)) tab$famille[tab$value %in% mapping_list[[nm]]] <- nm
+    }
+    aggregate(count ~ famille, tab, sum) |>
+      stats::setNames(c("famille","weight"))
+  }
+}
+
+extract_pct <- function(geom_input, raster_input, mode_agricole = "strict"){
+  agg <- .extract_weighted_table(geom_input, raster_input, mode_agricole = mode_agricole)
+  if (!nrow(agg)) return(data.frame(urbain=0, agricole=0, foret=0, autres=0))
+  total <- sum(agg$weight)
+  labs <- c("urbain","agricole","foret","autres")
+  res <- setNames(numeric(4), labs)
+  for (nm in labs) if (nm %in% agg$famille) res[nm] <- 100 * agg$weight[agg$famille==nm] / total
+  as.data.frame(as.list(res))
+}
+
+extract_pct_map <- function(geom_input, raster_input, mapping_list){
+  agg <- .extract_weighted_table(geom_input, raster_input, mapping_list = mapping_list)
+  if (!nrow(agg)) return(as.data.frame(as.list(setNames(rep(0, length(mapping_list)), names(mapping_list)))))
+  total <- sum(agg$weight)
+  res <- setNames(numeric(length(mapping_list)), names(mapping_list))
+  for (nm in names(mapping_list)) if (nm %in% agg$famille) res[nm] <- 100 * agg$weight[agg$famille==nm] / total
+  as.data.frame(as.list(res))
+}
+```
+
+## Extraction pondérée par surface
+
+Fonction générique pour extraire les pourcentages de chaque famille dans une géométrie donnée :
+
+```{r extract-pct}
+extract_pct <- function(geom_input, raster_input, mode_agricole = "strict") {
+  exactextractr::exact_extract(
+    raster_input, geom_input,
+    fun = function(values, coverage_fractions) {
+      data_temp <- data.frame(val = values, weight = coverage_fractions)
+      # Garder seulement classes 1–11 (exclut 253/254/255)
+      data_temp <- data_temp[!is.na(data_temp$val) & data_temp$val %in% 1:11, ]
+      
+      if (nrow(data_temp) == 0) {
+        return(data.frame(urbain = 0, agricole = 0, foret = 0, autres = 0))
+      }
+      
+      data_temp$famille <- vapply(
+        data_temp$val, 
+        function(x) map_famille(x, mode_agricole), 
+        character(1)
+      )
+      
+      aggregated <- aggregate(weight ~ famille, data_temp, sum)
+      total_weight <- sum(aggregated$weight)
+      
+      output_names <- c("urbain", "agricole", "foret", "autres")
+      output_values <- setNames(numeric(length(output_names)), output_names)
+      
+      for (nom_famille in output_names) {
+        if (nom_famille %in% aggregated$famille) {
+          output_values[nom_famille] <- 100 * aggregated$weight[aggregated$famille == nom_famille] / total_weight
+        }
+      }
+      
+      as.data.frame(as.list(output_values))
+    }
+  )
+}
+```
+
+## Extraction avec mapping personnalisé
+
+Pour les études de sensibilité, une fonction qui accepte des mappings personnalisés :
+
+```{r extract-pct-map}
+extract_pct_map <- function(geom_input, raster_input, mapping_list) {
+  exactextractr::exact_extract(raster_input, geom_input, fun = function(values, weights) {
+    data_temp <- data.frame(val = values, weight = weights)
+    data_temp <- data_temp[!is.na(data_temp$val) & data_temp$val %in% 1:11, ]
+    
+    if (!nrow(data_temp)) {
+      return(as.data.frame(setNames(as.list(rep(0, length(mapping_list))), names(mapping_list))))
+    }
+    
+    famille_vec <- rep("autres", nrow(data_temp))
+    for (nom_famille in names(mapping_list)) {
+      famille_vec[data_temp$val %in% mapping_list[[nom_famille]]] <- nom_famille
+    }
+    data_temp$famille <- famille_vec
+    
+    aggregated <- aggregate(weight ~ famille, data_temp, sum)
+    total_weight <- sum(aggregated$weight)
+    
+    output_values <- setNames(numeric(length(mapping_list)), names(mapping_list))
+    for (nom_famille in names(mapping_list)) {
+      if (nom_famille %in% aggregated$famille) {
+        output_values[nom_famille] <- 100 * aggregated$weight[aggregated$famille == nom_famille] / total_weight
+      }
+    }
+    
+    as.data.frame(as.list(output_values))
+  })
+}
+```
+
+------------------------------------------------------------------------
+
+# Analyse multi-sites {#sec-multisite}
+
+On calcule les proportions de couverture dans des **buffers de 1 km** et deux **anneaux** (0--300 m, 300--1000 m).
+
+```{r multisite-analysis}
+rayon_principal <- 1000
+limites_anneaux <- c(0, 300, 1000)
+
+liste_resultats_sites <- list()
+
+for (index_site in seq_len(nrow(sites))) {
+  # Point en EPSG:3035
+  point_site <- st_sfc(
+    st_point(c(sites$lon[index_site], sites$lat[index_site])), 
+    crs = 4326
+  ) |> st_transform(3035)
+  
+  # Buffer complet 0–1000 m
+  buffer_complet <- st_buffer(point_site, rayon_principal) |> 
+                    st_transform(crs(raster_clc))
+  
+  pourcentages_buffer <- extract_pct(buffer_complet, raster_clc)
+  
+  resultat_buffer <- cbind(
+    site = sites$site[index_site], 
+    zone = "0-1000m", 
+    round(pourcentages_buffer, 1)
+  )
+  
+  # Anneaux
+  anneau_1 <- st_difference(
+    st_buffer(point_site, limites_anneaux[2]),
+    st_buffer(point_site, limites_anneaux[1])
+  ) |> st_transform(crs(raster_clc))
+  
+  anneau_2 <- st_difference(
+    st_buffer(point_site, limites_anneaux[3]),
+    st_buffer(point_site, limites_anneaux[2])
+  ) |> st_transform(crs(raster_clc))
+  
+  pourcentages_anneau1 <- extract_pct(anneau_1, raster_clc)
+  pourcentages_anneau2 <- extract_pct(anneau_2, raster_clc)
+  
+  resultat_anneaux <- rbind(
+    cbind(site = sites$site[index_site], zone = "0-300m", round(pourcentages_anneau1, 1)),
+    cbind(site = sites$site[index_site], zone = "300-1000m", round(pourcentages_anneau2, 1))
+  )
+  
+  liste_resultats_sites[[index_site]] <- rbind(resultat_buffer, resultat_anneaux)
+}
+
+resultats_finaux <- do.call(rbind, liste_resultats_sites)
+knitr::kable(resultats_finaux, caption = "Composition de l'occupation du sol par site et zone")
+```
+
+## Visualisation comparative
+
+```{r fig-multisite, fig.height=5, fig.width=10}
+resultats_long <- resultats_finaux |>
+  pivot_longer(
+    cols = c(urbain, agricole, foret, autres),
+    names_to = "famille",
+    values_to = "pct"
+  )
+
+ggplot(resultats_long, aes(x = site, y = pct, fill = famille)) +
+  geom_col() +
+  facet_wrap(~zone, nrow = 1) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(
+    x = NULL,
+    y = "% dans le buffer",
+    fill = "Famille",
+    title = "Composition d'occupation du sol (CLC+ 2018, 10 m)",
+    subtitle = paste0("Buffers et anneaux autour de chaque site (EPSG:3035, rayon max = ", rayon_principal, " m)")
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 25, hjust = 1),
+    legend.position = "bottom"
+  )
+```
+
+------------------------------------------------------------------------
+
+# Études de sensibilité {#sec-sensitivity}
+
+
+## A) Granularité spatiale {#sec-granularity}
+
+Sensibilité des proportions au **rayon du buffer**.
+
+```{r granularity-analysis}
+# Paramètres
+serie_rayons <- c(300, 500, 750, 1000, 1500)
+
+# Point de référence : Orly
+point_orly_granul <- st_sfc(st_point(c(2.3658, 48.7283)), crs = 4326) |> 
+                     st_transform(3035)
+
+# Calcul pour chaque rayon avec une boucle FOR explicite
+liste_granularite <- list()
+
+for (index_rayon in seq_along(serie_rayons)) {
+  rayon_metres <- serie_rayons[index_rayon]
+  
+  # Créer le buffer en EPSG:3035 puis transformer vers CRS du raster
+  buffer_temp <- st_buffer(point_orly_granul, rayon_metres) |> 
+                 st_transform(crs(raster_clc))
+  
+  # Extraire les proportions
+  proportions_temp <- extract_pct(buffer_temp, raster_clc, mode_agricole = "strict")
+  proportions_temp$rayon_m <- rayon_metres
+  
+  # Stocker dans la liste
+  liste_granularite[[index_rayon]] <- proportions_temp
+}
+
+# Combiner tous les résultats
+resultats_granularite <- dplyr::bind_rows(liste_granularite) |>
+  dplyr::relocate(rayon_m)
+
+knitr::kable(resultats_granularite, digits = 1, caption = "Proportions selon le rayon du buffer")
+```
+
+```{r fig-granularity, fig.height=5, fig.width=8}
+resultats_granularite |>
+  tidyr::pivot_longer(
+    cols = c(urbain, agricole, foret, autres),
+    names_to = "famille",
+    values_to = "pct"
+  ) |>
+  dplyr::mutate(famille = factor(famille, levels = c("urbain", "agricole", "foret", "autres"))) |>
+  ggplot(aes(rayon_m, pct, color = famille)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2.5) +
+  scale_x_continuous(breaks = serie_rayons) +
+  scale_color_brewer(palette = "Dark2") +
+  labs(
+    x = "Rayon du buffer (m)",
+    y = "% de surface",
+    color = "Famille",
+    title = "Sensibilité des proportions à l'échelle (granularité)",
+    subtitle = "Mapping strict ; CLC+ 10 m (EPSG:3035)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "right")
+```
+
+::: callout-tip
+**Interprétation** : À petite échelle (300 m), le contexte immédiat domine (ex: piste d'aéroport → urbain élevé). En élargissant le rayon, on "moyenne" le paysage et les proportions se stabilisent progressivement.
+:::
+
+## B) Traitement compositionnel {#sec-compositional}
+
+Les proportions forment une **composition** (somme = 100%). Pour les analyser correctement en statistiques multivariées, on utilise la transformation **CLR** (Centered Log Ratio).
+
+**Problème** : `log(0)` → `-Inf`.
+
+**Solution** : ajouter un pseudo-compte epsilon (ex: 10⁻⁶) aux zéros uniquement, puis re-normaliser.
+
+```{r compositional-treatment}
+# Exemple : plus petit rayon
+proportions_min <- resultats_granularite |>
+  dplyr::filter(rayon_m == min(serie_rayons)) |>
+  dplyr::select(urbain, agricole, foret)
+
+proportions_vec <- as.numeric(proportions_min[1, ]) / 100
+names(proportions_vec) <- c("urbain", "agricole", "foret")
+
+# Ajout epsilon sur les zéros
+epsilon_value <- 1e-6
+proportions_eps <- proportions_vec
+proportions_eps[proportions_eps == 0] <- epsilon_value
+proportions_eps <- proportions_eps / sum(proportions_eps)
+
+# Transformation CLR
+valeurs_clr <- clr(acomp(proportions_eps))
+
+tableau_clr <- data.frame(
+  famille = names(proportions_vec),
+  proportion = proportions_vec,
+  proportion_eps = proportions_eps,
+  clr = as.numeric(valeurs_clr)
+)
+
+knitr::kable(tableau_clr, digits = 6, caption = "Transformation CLR robuste aux zéros")
+```
+
+::: callout-important
+Les valeurs CLR somment à zéro par construction. Elles permettent d'appliquer des analyses statistiques classiques (ACP, régression) sur des données compositionnelles.
+:::
+
+------------------------------------------------------------------------
+
+# Visualisation cartographique détaillée {#sec-mapping}
+
+Cette section présente une cartographie détaillée avec plusieurs cercles de distance pour visualiser les gradients de composition paysagère.
+
+## Préparation des géométries
+
+```{r map-prep}
+# Paramètres pour la carte détaillée
+serie_rayons_carte <- c(100, 300, 1000, 1500, 2000)
+
+# Point de référence : Orly
+point_orly_carte <- st_sfc(st_point(c(2.3658, 48.7283)), crs = 4326) |> 
+                    st_transform(3035)
+
+# Cercles concentriques (disques 0–R)
+liste_cercles <- list()
+for (numero_cercle in seq_along(serie_rayons_carte)) {
+  liste_cercles[[numero_cercle]] <- st_buffer(
+    point_orly_carte, 
+    serie_rayons_carte[numero_cercle]
+  )[[1]]
+}
+
+cercles_sf <- st_sf(
+  rayon = serie_rayons_carte,
+  geometry = st_sfc(liste_cercles, crs = 3035)
+) |> st_transform(crs(raster_clc))
+
+# Anneaux successifs (R_{i-1}–R_i)
+rayons_debut <- c(0, head(serie_rayons_carte, -1))
+rayons_fin <- serie_rayons_carte
+
+liste_anneaux_carte <- list()
+for (numero_anneau in seq_along(serie_rayons_carte)) {
+  anneau_geom <- st_difference(
+    st_buffer(point_orly_carte, rayons_fin[numero_anneau]),
+    st_buffer(point_orly_carte, rayons_debut[numero_anneau])
+  )[[1]] |> st_make_valid()
+  
+  liste_anneaux_carte[[numero_anneau]] <- anneau_geom
+}
+
+anneaux_sf <- st_sf(
+  ring = sprintf("%d–%dm", rayons_debut, rayons_fin),
+  geometry = st_sfc(liste_anneaux_carte, crs = 3035)
+) |>
+  st_transform(crs(raster_clc)) |>
+  dplyr::filter(!st_is_empty(geometry))
+```
+
+## Carte avec cercles de distance
+
+```{r fig-map, fig.height=7, fig.width=8}
+# Légende CLC+ Backbone (11 classes)
+etiquettes_clc <- c(
+  "1 Sealed", "2 Conifères", "3 Feuillus cad.", "4 Feuillus semperv.",
+  "5 Arbustes", "6 Herbacées perm.", "7 Herbacées pér.",
+  "8 Lichens/mousses", "9 Sols nus", "10 Eau", "11 Neige/Glace"
+)
+palette_clc <- c(
+  "#c84f4f", "#006400", "#66a61e", "#1b9e77",
+  "#a6761d", "#ffd92f", "#e6ab02",
+  "#b3b3b3", "#d9d9d9", "#1f78b4", "#a6cee3"
+)
+
+# Recadrage du raster autour de la zone d'intérêt
+boite_englobante <- st_buffer(point_orly_carte, max(serie_rayons_carte) + 250) |> 
+                    st_transform(crs(raster_clc))
+raster_recadre <- terra::crop(raster_clc, terra::vect(boite_englobante))
+
+# Création de la carte
+tmap_mode("plot")
+tm_shape(raster_recadre) +
+  tm_raster(
+    style = "cat",
+    palette = palette_clc,
+    labels = etiquettes_clc,
+    title = "CLC+ (10 m)"
+  ) +
+  tm_shape(cercles_sf) +
+  tm_borders(col = "black", lwd = c(0.8, 0.8, 1, 1.2, 1.5)) +
+  tm_text("rayon", just = "left", xmod = 0.01, ymod = -0.01, size = 0.6) +
+  tm_shape(st_transform(point_orly_carte, crs(raster_clc))) +
+  tm_symbols(col = "red", size = 0.15, shape = 19) +
+  tm_layout(
+    legend.outside = TRUE,
+    frame = FALSE,
+    title = "Occupation du sol et cercles de distance (Orly)",
+    title.size = 1,
+    legend.text.size = 0.7
+  )
+```
+
+## Courbes de composition par distance
+
+### Composition cumulée (0--R)
+
+```{r cumulative-analysis}
+# Calcul des proportions dans chaque cercle (cumulé depuis le centre)
+liste_resultats_cumul <- list()
+
+for (numero_rayon in seq_along(serie_rayons_carte)) {
+  rayon_cumul <- serie_rayons_carte[numero_rayon]
+  
+  geometrie_cumul <- st_buffer(point_orly_carte, rayon_cumul)[[1]] |>
+                     st_sfc(crs = 3035) |>
+                     st_transform(crs(raster_clc))
+  
+  proportions_cumul <- extract_pct(geometrie_cumul, raster_clc, mode_agricole = "strict")
+  proportions_cumul$type <- "cumul"
+  proportions_cumul$rayon_m <- rayon_cumul
+  
+  liste_resultats_cumul[[numero_rayon]] <- proportions_cumul
+}
+
+resultats_cumul <- dplyr::bind_rows(liste_resultats_cumul)
+```
+
+```{r fig-cumulative, fig.height=5, fig.width=8}
+resultats_cumul |>
+  tidyr::pivot_longer(
+    cols = c(urbain, agricole, foret, autres),
+    names_to = "famille",
+    values_to = "pct"
+  ) |>
+  ggplot(aes(x = rayon_m, y = pct, color = famille)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2.5) +
+  scale_x_continuous(breaks = serie_rayons_carte) +
+  scale_color_brewer(palette = "Set1") +
+  labs(
+    x = "Rayon (m)",
+    y = "% de surface (cumulé 0–R)",
+    color = "Famille",
+    title = "Répartition par distance — composition cumulée",
+    subtitle = "Mapping strict ; CLC+ 10 m (EPSG:3035)"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+### Composition par anneaux successifs
+
+```{r ring-analysis}
+# Calcul des proportions dans chaque anneau (couronnes successives)
+liste_resultats_anneaux <- list()
+
+for (numero_ring in seq_along(serie_rayons_carte)) {
+  rayon_interne <- rayons_debut[numero_ring]
+  rayon_externe <- rayons_fin[numero_ring]
+  
+  geometrie_anneau <- st_difference(
+    st_buffer(point_orly_carte, rayon_externe),
+    st_buffer(point_orly_carte, rayon_interne)
+  )[[1]] |> 
+    st_make_valid() |>
+    st_sfc(crs = 3035) |>
+    st_transform(crs(raster_clc))
+  
+  proportions_anneau <- extract_pct(geometrie_anneau, raster_clc, mode_agricole = "strict")
+  proportions_anneau$type <- "anneau"
+  proportions_anneau$ring <- sprintf("%d–%dm", rayon_interne, rayon_externe)
+  proportions_anneau$r_mid <- rayon_externe
+  
+  liste_resultats_anneaux[[numero_ring]] <- proportions_anneau
+}
+
+resultats_anneaux <- dplyr::bind_rows(liste_resultats_anneaux)
+```
+
+```{r fig-rings, fig.height=5, fig.width=8}
+resultats_anneaux |>
+  tidyr::pivot_longer(
+    cols = c(urbain, agricole, foret, autres),
+    names_to = "famille",
+    values_to = "pct"
+  ) |>
+  ggplot(aes(x = r_mid, y = pct, color = famille)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2.5) +
+  scale_x_continuous(breaks = serie_rayons_carte, labels = serie_rayons_carte) +
+  scale_color_brewer(palette = "Set1") +
+  labs(
+    x = "Limite externe de l'anneau (m)",
+    y = "% de surface (anneau)",
+    color = "Famille",
+    title = "Répartition par distance — par anneaux successifs",
+    subtitle = sprintf("Anneaux : %s m", paste(sprintf("%d–%d", rayons_debut, rayons_fin), collapse = ", "))
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+::: callout-note
+**Observation** : Les anneaux révèlent les **gradients locaux** de paysage, contrairement aux buffers cumulés qui moyennent progressivement. Utile pour détecter des changements brusques d'occupation du sol avec la distance au point.
+:::
+
+------------------------------------------------------------------------
+
+# Conclusion
+
+Cette analyse démontre l'importance de :
+
+1.  **Définir clairement les catégories** d'occupation du sol selon l'objectif (ex: quel seuil pour "agricole")
+2.  **Choisir l'échelle spatiale** appropriée (rayon du buffer) en fonction de l'écologie de l'espèce étudiée
+3.  **Traiter correctement les données compositionnelles** pour les analyses statistiques multivariées
+
+Ces méthodes sont applicables à tout type d'étude en **écologie du paysage**, **épidémiologie spatiale** ou **analyse des risques environnementaux**.
+
+------------------------------------------------------------------------
+
+# Informations système
+
+```{r session-info}
+sessionInfo()
+```
